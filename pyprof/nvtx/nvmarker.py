@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -35,10 +36,13 @@ The NVTX markers (one or more) contain the following information
 
 import torch
 import torch.cuda.nvtx as nvtx
+import torch.autograd.profiler as prof
 import numpy
 import inspect as ins
 import traceback
 import math
+import json
+from .config import Config
 
 
 def isfunc(mod, f):
@@ -68,61 +72,26 @@ def isfunc(mod, f):
     return ins.ismethod(attr) or ins.isfunction(attr) or ins.ismethoddescriptor(attr) or ins.isbuiltin(attr)
 
 
+# Nested dicts of this run's frame names to help uniquify them
+#
+# func_map[(partial_func_stack,frame_name)][filename+lineno] = frame_name_to_use
+#
+func_map = {}
+
 # Returns a dict string with a tracemarker and function stack in it
 #
 def traceMarker():
-    # Returns a string representing the stack of function calls separated with '/'
+    # Return a trace marker string and func_stack string
     #
-    def get_func_stack():
-        func_stack = ""
-        ins_stack = ins.stack()
-
-        # Starting at index of 3 to ignore this function, it's parent (traceMarker) and it's parent (wrapper_func)
-        #
-        for i in range(3, len(ins_stack)):
-            frame = ins_stack[i]
-            fn_name = frame[0].f_code.co_name
-            frame_info = ""
-
-            # __call__:  Much of Torch library is implemented in this way. Ignore these extra layers
-            # wrapper_func: Is a function in this file. If there are nested monkeypatched functions we don't want it to show up
-            # <module>: Just the top level module. Doesn't add any information and if it exists in any html it breaks it
-            #
-            if (fn_name in ["__call__","wrapper_func","<module>"]):
-                continue
-
-            # Grab class name if it exists
-            #
-            if 'self' in frame[0].f_locals:
-                cls_name = frame[0].f_locals['self'].__class__.__name__
-                frame_info += cls_name + "::"
-
-            frame_info += fn_name
-
-            # Prepend this frame's info into the function stack
-            #
-            func_stack = '/' + frame_info + func_stack
-
-        return func_stack
-
-    # Return a trace marker string
-    #
-    def get_trace_marker():
+    def get_trace_info():
         cadena = []
-        stack = traceback.extract_stack()
-        
-        # Starting at index of 3 to ignore this function, it's parent (traceMarker) and it's parent (wrapper_func)
-        #
-        for i in range(len(stack) - 3):
-            fi = stack[i]
-            t = "{}:{}".format(fi.filename, fi.lineno)
-            cadena.append(t)
-        return cadena
+        frame = ins.currentframe()
+        frame = frame.f_back.f_back
+        s = str(frame)
+        return s
 
-    d = {}
-    d['traceMarker'] = get_trace_marker()
-    d['funcStack'] = get_func_stack()
-    return str(d)
+    s = get_trace_info()    
+    return str(s)
 
 
 def modMarker(mod, fn_name, args):
@@ -137,7 +106,7 @@ def modMarker(mod, fn_name, args):
     return str(d)
 
 
-def add_wrapper(mod, fn_name):
+def add_wrapper(mod, fn_name, subType):
     assert isfunc(mod, fn_name)
 
     # Get a pointer to the original function
@@ -149,32 +118,21 @@ def add_wrapper(mod, fn_name):
                                        ) and (type(mod) is not torch.jit.TopLevelTracedModule)
 
     def wrapper_func(*args, **kwargs):
+        # cadena = argMarker(mod, fn_name, args, kwargs)
+        # tm = traceMarker(fn_name)
+        # all_marker = cadena + " | " + tm # Teng Gao: I just merge 2 lines into 1 lines.
+        frame = traceMarker()
 
-        # Push trace marker
-        nvtx.range_push(traceMarker())
+        all_marker = "Python~~~" + subType + "~~~" + mod.__name__ + "." + fn_name
 
-        # Push module marker
-        if s:
-            m = modMarker(mod, fn_name, args)
-            nvtx.range_push(m)
-
-        # Create and push argument marker
-        cadena = argMarker(mod, fn_name, args, kwargs)
-        nvtx.range_push(cadena)
-
+        nvtx.range_push(all_marker)
+        
         # Call the original function
         result = func(*args, **kwargs)
 
-        # Pop argumet marker
+        # Pop marker
         nvtx.range_pop()
-
-        # Pop module marker
-        if s:
-            nvtx.range_pop()
-
-        # Pop trace marker
-        nvtx.range_pop()
-
+        
         return result
 
     setattr(mod, fn_name, wrapper_func)
@@ -261,8 +219,9 @@ def argMarker(mod, op, args, kwargs):
 			'''
 
     cadena = {}
-    cadena['mod'] = mod.__name__
-    cadena['op'] = op
+    cadena['name'] = mod.__name__ + "." + op # Teng Gao: For user-friendly to see. parse.py MUST also be changed!
+    #cadena['mod'] = mod.__name__
+    #cadena['op'] = op
     cadena['args'] = []
 
     foo(args, "")
@@ -272,71 +231,66 @@ def argMarker(mod, op, args, kwargs):
     return str(cadena)
 
 
-def patchClass(cls):
+def patchClass(cls, subType):
     for f in dir(cls):
         if isfunc(cls, f):
-            add_wrapper(cls, f)
+            add_wrapper(cls, f, subType)
 
-# Monkey-patch all classes in torch
-#
 def patch_torch_classes():
+    """Monkey-patch all classes in torch"""
     for cls in [
-            torch,
-            torch.Tensor,
-            torch.nn.functional,
+            torch, # All member functions of torch
+            torch.Tensor, # All member functions of Tensor
+            torch.nn.functional, # All member functions of torch.nn.functional
     ]:
-        patchClass(cls)
+        patchClass(cls, "MemberFunc")
 
 
-# Monkey-patch all forward functions in torch.nn libraries
-#
 def patch_torch_nn_forward_functions():
-    for cls in [torch.nn.RNN, torch.nn.RNNCell, torch.nn.LSTM, torch.nn.LSTMCell, torch.nn.GRU, torch.nn.GRUCell]:
-        if isfunc(cls, 'forward'):
-            add_wrapper(cls, 'forward')
+    #"""Monkey-patch all forward functions in torch.nn libraries"""
+    #for cls in [torch.nn.RNN, torch.nn.RNNCell, torch.nn.LSTM, torch.nn.LSTMCell, torch.nn.GRU, torch.nn.GRUCell]:
+    #    if isfunc(cls, 'forward'):
+    #        add_wrapper(cls, 'forward')
+    for cls in dir(torch.nn):
+        attr = getattr(torch.nn, cls)
+        if ins.isclass(attr):
+            for f in dir(attr):
+                if isfunc(attr, f) and f == "forward":
+                    add_wrapper(attr, f, "Forward")
 
-
-# Monkey-patch the dataloader in torch.utils.data
-#
 def patch_dataloader():
+    """Monkey-patch the dataloader in torch.utils.data"""
     mod = torch.utils.data.dataloader
     old_iter = mod.DataLoader.__iter__
 
     def new_iter(self, *args, **kwargs):
 
-        # Push trace marker
-        nvtx.range_push(traceMarker())
-
-        # First pass is for creating the dataloader + returning the first data
         cadena = argMarker(mod, "DataLoader", args, kwargs)
-        nvtx.range_push(cadena)
+        tm = traceMarker()
+        all_marker = cadena + " | " + tm # Teng Gao: I just merge 2 lines into 1 lines.
+        # Push marker
+        nvtx.range_push("Python~~~DataLoader~~~" + all_marker)
+        
+        # First pass is for creating the dataloader + returning the first data        
 
-        for x in old_iter(self, *args, **kwargs):
-
-            # Pop tracemarker
-            nvtx.range_pop();           
-
-            # Dataloader stop, Model start
-            nvtx.range_pop() 
+        for x in old_iter(self, *args, **kwargs):            
+            nvtx.range_pop();    
 
             yield x
 
-            # Push trace marker
-            nvtx.range_push(traceMarker())
-
-            # Model stop, dataloader start
             cadena = argMarker(mod, "DataLoader", args, kwargs)
-            nvtx.range_push(cadena)
+            tm = traceMarker()
+            all_marker = cadena + " | " + tm
+            # Push marker
+            nvtx.range_push("Python~~~DataLoader~~~" + all_marker)
 
-        # Pop the last iteration before returning
-        nvtx.range_pop()
+        # Pop the last iteration before returning        
         nvtx.range_pop()
 
     mod.DataLoader.__iter__ = new_iter
 
-# Monkey-patch functions in APEX
-#
 def patch_apex():
+    """Monkey-patch functions in APEX"""
     import importlib
     if importlib.util.find_spec("amp_C") is not None:
         import amp_C
@@ -350,12 +304,181 @@ def patch_apex():
         import fused_layer_norm_cuda
         patchClass(fused_layer_norm_cuda)
 
-def init():
+
+def push_nvtx_model_config(config):
+    """
+    Helper function to dump the passed in dict config as an nvtx
+    marker with "model_config" key
+    """
+    nvtx_msg = json.dumps({"model_config": config})
+    nvtx.range_push(nvtx_msg)
+
+
+def patch_dataloader_init():
+    """
+    Capture dataloader config (num_workers and pin_memory) and
+    emit a model_config nvtx range with the information
+    """
+    mod = torch.utils.data.dataloader
+    old_init = mod.DataLoader.__init__
+
+    def new_init(self, *args, **kwargs):
+
+        num_workers = kwargs.get("num_workers",0)
+        pin_memory = kwargs.get("pin_memory", False)
+
+        push_nvtx_model_config({"num_workers": num_workers, "pin_memory": pin_memory})
+        old_init(self, *args, **kwargs)
+        nvtx.range_pop()
+
+    mod.DataLoader.__init__ = new_init
+
+
+# Flag to indicate that cudnn_benchmark_disabled has already been reported
+#
+cudnn_benchmark_disabled_reported = False
+
+def patch_with_always_benchmark(mod, fn_name):
+    """
+    Patch the given mod/function so that if it is ever executed and 
+    torch.backends.cudnn.benchmark is not true, it will emit an nvtx
+    range to report that fact
+    """
+    assert isfunc(mod, fn_name)
+    old_fn = getattr(mod, fn_name)
+
+    def always_benchmark_wrapper(*args, **kwargs):
+        global cudnn_benchmark_disabled_reported
+
+        add_nvtx = not torch.backends.cudnn.benchmark and not cudnn_benchmark_disabled_reported
+        if add_nvtx:
+            cudnn_benchmark_disabled_reported = True
+            push_nvtx_model_config({"cudnn_benchmark_disabled": True})
+
+        result = old_fn(*args, **kwargs)
+
+        if add_nvtx:
+            nvtx.range_pop()
+
+        return result
+
+    setattr(mod, fn_name, always_benchmark_wrapper)
+
+
+def patch_never_call(mod, fn_name, key):
+    """
+    Patch the given mod/function. If the function is executed, emit 
+    an nvtx_range with data indicating that 'key' was true
+    """
+    old_fn = getattr(mod, fn_name)
+
+    def wrapper_func(*args, **kwargs):
+        push_nvtx_model_config({key: True})
+        result = old_fn(*args, **kwargs)
+        nvtx.range_pop()
+        return result
+
+    setattr(mod, fn_name, wrapper_func)
+
+
+def patch_never_call_with_args(mod, fn_name, key, bad_args):
+    """
+    Patch the given mod/function. If the function is executed 
+    and any of the bad args have any of the listed bad values, 
+    emit an nvtx_range with data indicating that 'key' was true
+    """
+    old_fn = getattr(mod, fn_name)
+
+    def wrapper_func(*args, **kwargs):
+
+        signature = ins.signature(old_fn)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+
+        problem = False
+        for k,v in bound.arguments.items():
+            if k in bad_args:
+                if v in bad_args[k]:
+                    problem = True
+
+        if problem:
+            push_nvtx_model_config({key: True})
+
+        result = old_fn(*args, **kwargs)
+
+        if problem:
+            nvtx.range_pop()
+
+        return result
+
+    setattr(mod, fn_name, wrapper_func)
+
+
+def patch_model_configs():
+    """
+    Patch functions that help gather high-level configuration options for the model.
+    All resulting nvtx ranges will have 'model_config' as the primary key
+    """
+
+    patch_dataloader_init()
+
+    patch_with_always_benchmark(torch.nn.functional, "conv1d")
+    patch_with_always_benchmark(torch.nn.functional, "conv2d")
+    patch_with_always_benchmark(torch.nn.functional, "conv3d")
+    patch_with_always_benchmark(torch.nn.functional, "conv_transpose1d")
+    patch_with_always_benchmark(torch.nn.functional, "conv_transpose2d")
+    patch_with_always_benchmark(torch.nn.functional, "conv_transpose3d")
+
+    # Teng Gao: The following seems useless:
+
+    #patch_never_call(torch.autograd.detect_anomaly, "__init__", "detect_anomaly")
+    #patch_never_call(torch.autograd, "gradcheck", "gradcheck")
+    #patch_never_call(torch.autograd, "gradgradcheck", "gradgradcheck")
+    #patch_never_call(torch.autograd.profiler.record_function, "__init__", "record_function")
+
+    #patch_never_call_with_args(torch.autograd.profiler.profile, "__init__", "profile", {"enabled": {True}})
+    #patch_never_call_with_args(torch.autograd.set_detect_anomaly, "__init__", "detect_anomaly", {"mode": {True}})
+    #patch_never_call_with_args(torch.autograd.profiler.emit_nvtx, "__init__", "emit_nvtx", {"enabled": {True}})
+
+
+def patch_optim():
+    print("Patching optim...")
+    for cls in dir(torch.optim):
+        attr = getattr(torch.optim, cls)
+        if ins.isclass(attr):
+            patchClass(attr, "Optim")
+
+
+def patch_torchvision():
+    print("Patching torchvision...")
+    import torchvision.models as models
+    for cls in dir(models):
+        attr = getattr(models, cls)
+        if ins.isclass(attr):
+            for f in dir(attr):
+                if isfunc(attr, f) and f == "forward":
+                    add_wrapper(attr, f, "Forward")
+
+
+def init(**kwargs):
+    """
+    Initialize pyprof and monkey-patch Torch functions
+
+    Kwargs:
+        enable_function_stack (bool): When true, function stack information will be added to NVTX markers
+    """
+
+    config = Config(**kwargs)
+
     print("Initializing NVTX monkey patches")
 
     patch_dataloader()
     patch_torch_classes()
     patch_torch_nn_forward_functions()
-    patch_apex()
+    #patch_apex()
+    #patch_model_configs()
+
+    patch_optim()
+    patch_torchvision()
 
     print("Done with NVTX monkey patching")
