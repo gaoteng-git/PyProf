@@ -679,8 +679,14 @@ def buildNVTXTree(db, roots):
     start_time = None
     for r in result: 
         start_time = r['start']        
-    cmd = 'SELECT start, end, text as name, globalTid FROM NVTX_EVENTS \
-        WHERE start > ' + str(start_time) + ' ORDER BY start ASC'
+    if start_time is None:
+        print("No __start_profile, get all nvtx")
+        cmd = 'SELECT start, end, text as name, globalTid FROM NVTX_EVENTS \
+            ORDER BY start ASC'        
+    else:
+        print("With __start_profile, get nvtx after that")
+        cmd = 'SELECT start, end, text as name, globalTid FROM NVTX_EVENTS \
+            WHERE start > ' + str(start_time) + ' ORDER BY start ASC'
     result = db.select(cmd)    
     for r in result:        
         if r['end'] == None:
